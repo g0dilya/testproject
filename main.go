@@ -7,6 +7,8 @@ import (
 	"math"
 	"net/http"
 	"os"
+	"strconv"
+	"strings"
 	"time"
 
 	"fyne.io/fyne/v2"
@@ -79,12 +81,13 @@ type PairData struct {
 
 // Структура для хранения данных о транзакции
 type TransactionData struct {
-	Date       string  `json:"date"`
-	AmountUSD  float64 `json:"amount_usd"`
-	TokenCount float64 `json:"token_count"`
-	Price      float64 `json:"price"`
-	Wallet     string  `json:"wallet"`
-	Type       string  `json:"type"`
+	Date           string  `json:"date"`
+	AmountUSD      float64 `json:"amount_usd"`
+	TokenCountQuote float64 `json:"token_count_quote"`
+	TokenCountBase float64 `json:"token_count_base"`
+	Price          float64 `json:"price"`
+	Wallet         string  `json:"wallet"`
+	Type           string  `json:"type"`
 }
 
 // Функция для получения данных о паре по адресу контракта
@@ -129,64 +132,96 @@ func getPairData(contractAddress string) (*PairData, error) {
 }
 
 // Функция для получения данных о транзакциях за последние 7 дней
-func getRecentTransactions(apiKey, chainID, contractAddress string) ([]TransactionData, error) {
+func getRecentTransactions(apiKey, chainID, contractAddress string, baseTokenSymbol string, quoteTokenSymbol string) ([]TransactionData, error) {
 	client := covalentclient.CovalentClient(apiKey)
-	page := 0
+	if client == nil || client.TransactionService == nil {
+		return nil, fmt.Errorf("failed to create client or transaction service")
+	}
 
 	endDate := time.Now()
 	startDate := endDate.AddDate(0, 0, -7)
 
 	var transactions []TransactionData
 
-	for {
-		resp, err := client.TransactionService.GetTransactionsForAddressV3(chains.Chain(chainID), contractAddress, page, services.GetTransactionsForAddressV3QueryParamOpts{})
-		if err != nil {
-			return nil, fmt.Errorf("failed to fetch transactions: %w", err)
+	transactionChannel := client.TransactionService.GetAllTransactionsForAddress(chains.Chain(chainID), contractAddress, services.GetAllTransactionsForAddressQueryParamOpts{})
+
+	var firstTransactionResponse string
+	firstTransactionFound := false
+
+	for txResult := range transactionChannel {
+		if txResult.Err != nil {
+			fmt.Printf("Error fetching transactions: %s\n", txResult.Err)
+			return nil, fmt.Errorf("failed to fetch transactions: %w", txResult.Err)
+		}
+		tx := txResult.Transaction
+
+		if !firstTransactionFound {
+			txJSON, _ := json.MarshalIndent(tx, "", "  ")
+			firstTransactionResponse = string(txJSON)
+			fmt.Printf("First Transaction API Response: %s\n", firstTransactionResponse)
+			firstTransactionFound = true
 		}
 
-		for _, tx := range resp.Data.Items {
-			if tx.BlockSignedAt.Before(startDate) {
-				return transactions, nil
-			}
+		if tx.BlockSignedAt == nil {
+			fmt.Println("Skipping transaction with nil BlockSignedAt")
+			continue
+		}
 
-			value, _ := tx.Value.Float64()
-			// Пропускаем пустые транзакции
-			if value == 0 || math.IsNaN(value) {
-				continue
-			}
+		if tx.BlockSignedAt.Before(startDate) {
+			break
+		}
 
-			transactionType := "unknown"
-			if tx.LogEvents != nil {
-				for _, log := range *tx.LogEvents {
-					if log.Decoded != nil && *log.Decoded.Name == "Swap" {
-						for _, param := range *log.Decoded.Params {
+		fmt.Printf("Processing transaction with BlockSignedAt: %s\n", tx.BlockSignedAt.String())
+
+		if tx.Value == nil || tx.ValueQuote == nil || tx.FromAddress == nil {
+			fmt.Println("Skipping transaction with nil values")
+			continue
+		}
+
+		value, _ := tx.Value.Float64()
+		// Пропускаем пустые транзакции
+		if value == 0 || math.IsNaN(value) {
+			fmt.Println("Skipping transaction with zero or NaN value")
+			continue
+		}
+
+		transactionType := "unknown"
+		var tokenCountBase float64
+		if tx.LogEvents != nil {
+			for _, log := range *tx.LogEvents {
+				if log.Decoded != nil && log.Decoded.Name != nil && (*log.Decoded.Name == "Swap" || *log.Decoded.Name == "execute") {
+					for _, param := range *log.Decoded.Params {
+						if param.Value != nil {
 							if paramValue, ok := (*param.Value).(string); ok {
-								if *param.Name == "buyer" && paramValue == *tx.FromAddress {
+								if param.Name != nil && *param.Name == "buyer" && paramValue == *tx.FromAddress {
 									transactionType = "buy"
-								} else if *param.Name == "seller" && paramValue == *tx.FromAddress {
+								} else if param.Name != nil && *param.Name == "seller" && paramValue == *tx.FromAddress {
 									transactionType = "sell"
 								}
+							}
+							// Извлекаем количество базовых токенов
+							if param.Name != nil && (*param.Name == "amount0Out" || *param.Name == "amount1Out" || *param.Name == "value") {
+								tokenCountBase, _ = strconv.ParseFloat(fmt.Sprintf("%v", *param.Value), 64)
+								tokenCountBase = tokenCountBase / math.Pow(10, 18) // Преобразуем в токены
 							}
 						}
 					}
 				}
 			}
-
-			transactions = append(transactions, TransactionData{
-				Date:       tx.BlockSignedAt.Format(time.RFC3339),
-				AmountUSD:  *tx.ValueQuote,
-				TokenCount: value,
-				Price:      *tx.ValueQuote / value,
-				Wallet:     *tx.FromAddress,
-				Type:       transactionType,
-			})
 		}
 
-		if resp.Data.Links.Next == nil {
-			break
-		}
+		// Делим количество токенов на 10^18 чтобы получить значение в токенах
+		tokenCountQuote := value / math.Pow(10, 18)
 
-		page++
+		transactions = append(transactions, TransactionData{
+			Date:           tx.BlockSignedAt.Format("2006-01-02 15:04:05"), // Изменено форматирование даты
+			AmountUSD:      *tx.ValueQuote,
+			TokenCountQuote: tokenCountQuote,
+			TokenCountBase: tokenCountBase,
+			Price:          *tx.ValueQuote / tokenCountQuote,
+			Wallet:         *tx.FromAddress,
+			Type:           transactionType,
+		})
 	}
 
 	return transactions, nil
@@ -234,8 +269,13 @@ func writeReportToFile(filename string, pairData *PairData, transactions []Trans
 
 	report += "\nRecent Transactions (Last 7 days):\n"
 	for _, tx := range transactions {
-		report += fmt.Sprintf("Date: %s, Amount (USD): %.2f, Token Count: %.2f, Price: %.2f, Wallet: %s, Type: %s\n",
-			tx.Date, tx.AmountUSD, tx.TokenCount, tx.Price, tx.Wallet, tx.Type)
+		tokenCountQuoteFormatted := fmt.Sprintf("%.5f", tx.TokenCountQuote)
+		tokenCountQuoteFormatted = strings.ReplaceAll(tokenCountQuoteFormatted, ".", ",")
+		tokenCountBaseFormatted := fmt.Sprintf("%.5f", tx.TokenCountBase)
+		tokenCountBaseFormatted = strings.ReplaceAll(tokenCountBaseFormatted, ".", ",")
+		priceFormatted := fmt.Sprintf("$%.7f", tx.Price)
+		report += fmt.Sprintf("Date: %s, Amount (USD): %.2f, Token Count (%s): %s, Token Count (%s): %s, Price: %s, Wallet: %s, Type: %s\n",
+			tx.Date, tx.AmountUSD, pairData.QuoteToken.Symbol, tokenCountQuoteFormatted, pairData.BaseToken.Symbol, tokenCountBaseFormatted, priceFormatted, tx.Wallet, tx.Type)
 	}
 
 	_, err = file.WriteString(report)
@@ -303,12 +343,14 @@ func main() {
 		}
 
 		statusLabel.SetText("Fetching recent transactions...")
-		transactions, err := getRecentTransactions(apiKey, chainID, contractAddress)
+		transactions, err := getRecentTransactions(apiKey, chainID, contractAddress, pairData.BaseToken.Symbol, pairData.QuoteToken.Symbol)
 		if err != nil {
 			statusLabel.SetText("")
 			dialog.ShowError(fmt.Errorf("failed to get recent transactions: %w", err), myWindow)
 			return
 		}
+
+		fmt.Printf("Fetched transactions: %+v\n", transactions)
 
 		statusLabel.SetText("Writing report to file...")
 		err = writeReportToFile(filename, pairData, transactions)
